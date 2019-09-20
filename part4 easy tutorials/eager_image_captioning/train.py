@@ -88,6 +88,7 @@ exe.run(fluid.default_startup_program())
 
 # ~13 min on GTX 1080Ti
 
+
 fluid.io.load_params(exe, './pretrained', image_feature_extract_program)
 
 print('extracting features...')
@@ -167,6 +168,13 @@ def pad_sequences(train_seqs, max_len, pad_id=0):
         else:
             train_seqs_w_padding.append(seq[:max_len])
     return train_seqs_w_padding
+
+def ids_to_texts(ids, i2w):
+    texts = ""
+    for id in ids:
+        if id != 0 and id != 1 and id != w2i['<start>'] and id != w2i['<end>']:
+            texts += i2w[id] + ' '
+    return texts
 
 print('tokenizing...')
 
@@ -300,6 +308,7 @@ class RNNDecoder(fluid.dygraph.Layer):
         x = self.fc2(x)
         return x, state, attention_weights
 
+# segfault on GPU
 def cx_loss(y_true, y_pred):
     zeros = fluid.layers.zeros_like(y_true)
     mask  = fluid.layers.logical_not(fluid.layers.equal(y_true, zeros))
@@ -308,12 +317,25 @@ def cx_loss(y_true, y_pred):
     loss_ = fluid.layers.softmax_with_cross_entropy(y_pred, y_true) * mask
     return fluid.layers.reduce_sum(loss_)
 
+def cx_loss_np(y_true, y_pred):
+    zeros_np = np.zeros(y_true.shape)
+    mask_np = np.logical_not(np.equal(y_true.numpy(), zeros_np)).astype('float32')
+    mask = to_variable(mask_np)
+    loss_ = fluid.layers.softmax_with_cross_entropy(y_pred, y_true) * mask
+    return fluid.layers.reduce_sum(loss_)
+
+# ~2.5min per epoch on GTX 1080
+
 def train():
-    place = fluid.CPUPlace()
+    place = fluid.CUDAPlace(1)
     with fluid.dygraph.guard(place):
 
         encoder = CNNEncoder('encoder', embedding_dim)
         decoder = RNNDecoder('decoder', embedding_dim, units, vocab_size)
+        encoder_weight, _ = fluid.dygraph.load_persistables('./weight/encoder/')
+        decoder_weight, _ = fluid.dygraph.load_persistables('./weight/decoder/') 
+        encoder.load_dict(encoder_weight)
+        decoder.load_dict(decoder_weight)
 
         optimizer = fluid.optimizer.Adam(learning_rate=1e-3)
 
@@ -338,7 +360,7 @@ def train():
                     # passing the features through the decoder
                     predictions, hidden, _ = decoder(dec_input, features, hidden)
 
-                    loss = cx_loss(cap_tensor[:, i], predictions)
+                    loss = cx_loss_np(cap_tensor[:, i], predictions)
 
                     batch_loss += loss
 
@@ -355,7 +377,7 @@ def train():
             fluid.dygraph.save_persistables(encoder.state_dict(), './weight/encoder/')
             fluid.dygraph.save_persistables(decoder.state_dict(), './weight/decoder/')                                                     
 
-def evaluate(image):
+def get_caption(image):
 
     fluid.io.load_params(exe, './pretrained', image_feature_extract_program)
 
@@ -423,11 +445,28 @@ def plot_attention(image, result, attention_plot):
     plt.tight_layout()
     plt.show()
 
+train_images_4checking = [img_name_train[4],  img_name_train[10], img_name_train[30]]
+train_captions_4checking = [cap_train[4], cap_train[10], cap_train[30]]
+validation_images_4checking = [img_name_val[7], img_name_val[10], img_name_val[12]]
+validation_captions_4checking = [cap_val[7], cap_val[10], cap_val[12]]
+
+def check_sample_captions(mode='training', plot=False):
+    if mode == 'training':
+        images = train_images_4checking
+        captions = train_captions_4checking
+    elif mode == 'validation':
+        images = validation_images_4checking
+        captions = validation_captions_4checking
+    print('\nSample checks on', mode)
+
+    for i in range(len(images)):
+        result, attention_plot = get_caption(images[i])
+        print('\nReal Caption:', ids_to_texts(captions[i], i2w))
+        print('Prediction Caption:', ' '.join(result))
+        if plot:
+            plot_attention(images[i], result, attention_plot)
+
 if __name__ == '__main__':
-    train()
-    image_path = './surf.jpg'
-    result, attention_plot = evaluate(image_path)
-    plot_attention(image_path, result, attention_plot)
-    print ('Prediction Caption:', ' '.join(result))
-
-
+    # train()
+    check_sample_captions(mode='training', plot=True)
+    check_sample_captions(mode='validation', plot=True)
